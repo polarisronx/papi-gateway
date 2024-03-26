@@ -1,1 +1,13 @@
-spring.application.name=papi-gateway
+spring:
+  application:
+    name: papi-gateway
+  cloud:
+    gateway:
+      routes:
+        - id: papi-route
+          uri: http://localhost:8123
+          predicates:
+            - Path=/api/**
+
+server:
+  port: 8090
