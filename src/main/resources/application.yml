@@ -8,6 +8,16 @@ spring:
           uri: http://localhost:8123
           predicates:
             - Path=/api/**
-
+dubbo:
+  application:
+    name: openAPI-backend
+  # 设置dubbo的协议为dubbo，随机分配端口
+  protocol:
+    name: dubbo
+    port: 22223
+  registry:
+    # 配置注册中心为 nacos，使用的地址是 nacos://127.0.0.1:8848
+    id: nacos-registry
+    address: nacos://127.0.0.1:8848
 server:
   port: 8090
