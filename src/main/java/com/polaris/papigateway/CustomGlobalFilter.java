@@ -1,13 +1,22 @@
 package com.polaris.papigateway;
 
 
+import cn.hutool.core.util.RandomUtil;
 import com.polaris.common.entity.InterfaceInfo;
 import com.polaris.common.entity.User;
+import com.polaris.common.exception.ErrorCode;
 import com.polaris.common.service.InnerInterfaceInfoService;
 import com.polaris.common.service.InnerUserInterfaceInfoService;
 import com.polaris.common.service.InnerUserService;
-import com.polaris.papiclientsdk.utils.SignUtils;
+import com.polaris.papiclientsdk.common.enums.RequestMethodEnum;
+
+import com.polaris.papiclientsdk.common.execption.PapiClientSDKException;
+import com.polaris.papiclientsdk.common.model.AbstractClient;
+import com.polaris.papiclientsdk.common.model.Credential;
+import com.polaris.papiclientsdk.common.utils.SignUtils;
+import com.polaris.papigateway.exception.BusinessException;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.dubbo.config.annotation.DubboReference;
 import org.reactivestreams.Publisher;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
@@ -22,22 +31,21 @@ import org.springframework.http.server.reactive.ServerHttpRequest;
 import org.springframework.http.server.reactive.ServerHttpResponse;
 import org.springframework.http.server.reactive.ServerHttpResponseDecorator;
 import org.springframework.stereotype.Component;
+import org.springframework.util.MultiValueMap;
 import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import javax.swing.*;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Objects;
+import java.util.*;
 
-import static com.polaris.papigateway.utils.GatewayUtils.INTERFACE_HOST;
-import static com.polaris.papigateway.utils.GatewayUtils.IP_WHITE_LIST;
+
 
 /**
- * @Author polaris
- * @Create 2024-03-26 19:13
- * @Version 1.0
+ * @author polaris
+ * @create 2024-03-26 19:13
+ * @version 1.0
  * ClassName CustomGlobalFilter
  * Package com.polaris.papigateway
  * Description 网关全局过滤器，负责用户鉴权、接口是否存在校验
@@ -45,6 +53,8 @@ import static com.polaris.papigateway.utils.GatewayUtils.IP_WHITE_LIST;
 @Slf4j
 @Component
 public class CustomGlobalFilter implements GlobalFilter, Ordered {
+    public static final List<String> IP_WHITE_LIST= Arrays.asList("127.0.0.1");
+    public static final String INTERFACE_HOST="http://localhost:8123";
 
     @DubboReference
     private InnerUserService innerUserService;
@@ -57,14 +67,12 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
     public Mono<Void> filter (ServerWebExchange exchange, GatewayFilterChain chain){
         ServerHttpRequest req = exchange.getRequest();
         String sourceAddress = Objects.requireNonNull(req.getLocalAddress()).getHostString();
-        String path = INTERFACE_HOST+req.getPath().value();
         String method = Objects.requireNonNull(req.getMethod()).toString();
+        MultiValueMap<String, String> queryParams = req.getQueryParams();
         // 01 打印请求日志
         log.info("请求唯一标识："+req.getId());
-        log.info("请求路径："+ path);
         log.info("请求方法："+ method);
-        log.info("请求参数："+req.getQueryParams());
-
+        log.info("请求参数："+ queryParams);
         log.info("请求来源地址："+sourceAddress);
         log.info("请求来源端口："+req.getRemoteAddress());
         // 获取响应对象
@@ -76,13 +84,26 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
         // 03 用户鉴权
         // 从请求头中获取 签名认证的参数 的值
         HttpHeaders headers = req.getHeaders();
-        String accessKey = headers.getFirst("accessKey");
-        String body = headers.getFirst("body");
-        String timestamp = headers.getFirst("timestamp");
+        String contentType;
+        if(method.equals(RequestMethodEnum.POST.getMethod())) {
+            contentType = headers.getFirst("Content-Type");
+        }else {
+            contentType="-";
+        }
+        String host = headers.getFirst("Host");
+        String authorization = headers.getFirst("Authorization");
+        String action = headers.getFirst("Action");
         String nonce = headers.getFirst("nonce");
-        String sign = headers.getFirst("sign");
+        String accessKey = headers.getFirst("AccessKey");
+        String timestamp = headers.getFirst("Timestamp");
+        String apiVersion = headers.getFirst("ApiVersion");
+        String sdkVersion = headers.getFirst("SdkVersion");
+        String hashedRequestPayload = headers.getFirst("Content-SHA256");
+
+        if (StringUtils.isAnyBlank(authorization, accessKey, timestamp, nonce, action)){
+            throw new BusinessException(ErrorCode.FORBIDDEN_ERROR,"参数缺失");
+        }
         // 进行 权限校验 的验证逻辑
-        // 校验 accessKey
         User invokeUser = null;
         try {
             // 调用内部服务，根据AK获取用户信息
@@ -93,45 +114,65 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
         }
         if (invokeUser == null){
             // 用户为空说明AK异常，没有访问权限
-            return handleReject(resp);
+            throw new BusinessException(ErrorCode.FORBIDDEN_ERROR,"密钥ID不正确或账户不存在");
         }
         // 校验随机数 nonce
+        // todo 集成Redis后修复
         assert nonce != null;
-        if (Long.parseLong(nonce) > 10000){
-            return handleReject(resp);
-        }
+//        if (Long.parseLong(nonce) > 10000){
+//            return handleReject(resp);
+//        }
         // 校验时间戳 timestamp 与 当前时间的差距，超过5分钟说明过期
         assert timestamp != null;
         if (Math.abs(System.currentTimeMillis()/1000 - Long.parseLong(timestamp)) > 5 * 60){
-            return handleReject(resp);
-        }
-        // 校验签名 sign
-        String secretKey = invokeUser.getSecretKey();
-        // 生成签名
-        String expectedSign = SignUtils.genSign(body,secretKey);
-        if (sign==null||!sign.equals(expectedSign)){
-            // 签名为空或与服务器生成的签名不一致则说明没有权限
-            return handleReject(resp);
+            throw new BusinessException(ErrorCode.NOT_LOGIN_ERROR,"请求已过期,请登录后重试");
         }
         // 04 判断接口是否存在
         InterfaceInfo interfaceInfo = null;
         try {
-            interfaceInfo = innerInterfaceInfoService.getInterfaceInfo(path, method);
+            interfaceInfo = innerInterfaceInfoService.getInterfaceInfo(action, method);
+
         } catch (Exception e) {
             // 捕获异常
             log.error("获取接口信息失败", e);
         }
         if (interfaceInfo == null){
             // 接口不存在则说明没有权限
-            return handleReject(resp);
+            throw new BusinessException(ErrorCode.NOT_FOUND_ERROR,"接口不存在");
         }
+        // 校验签名 sign
+        String secretKey = invokeUser.getSecretKey();
+        String endpoint = interfaceInfo.getEndpoint();
+        log.info("请求路径："+ "http://"+endpoint+req.getPath().value());
+        // 生成签名
+
+        Map<String, String> canonicalHeaderMap = AbstractClient.getCanonicalHeader(method, timestamp, contentType, endpoint);
+        String canonicalRequest = null;
+        try {
+            canonicalRequest = AbstractClient.getCanonicalRequest(method, req.getPath().value(), canonicalHeaderMap, hashedRequestPayload, toHashMap(queryParams));
+        } catch (PapiClientSDKException e) {
+            throw new BusinessException(ErrorCode.SYSTEM_ERROR,e.getMessage());
+        }
+
+        String expectedAuthorization = null;
+        try {
+            expectedAuthorization = SignUtils.getAuthorization("papi",timestamp,new Credential(accessKey,secretKey),canonicalRequest,canonicalHeaderMap.get("signedHeaders"));
+        } catch (PapiClientSDKException e) {
+            throw new BusinessException(ErrorCode.SYSTEM_ERROR,e.getMessage());
+        }
+
+        if (authorization==null||!authorization.equals(expectedAuthorization)){
+            // 签名为空或与服务器生成的签名不一致则说明没有权限
+            throw new BusinessException(ErrorCode.NO_AUTH_ERROR,"请求非法");
+        }
+
         Long interfaceInfoId = interfaceInfo.getId();
         Long userId = invokeUser.getId();
-        // 判断是否还有调用次数
+        // 05 判断是否还有调用次数
         if(innerUserInterfaceInfoService.leftCount(interfaceInfoId,userId)<=0){
-            return handleReject(resp);
+            throw new BusinessException(ErrorCode.NO_ACCESS_ERROR,"调用次数不足");
         }
-        // 05 请求转发，调用接口
+        // 06 请求转发，调用接口
         return handleResponse(exchange, chain, interfaceInfoId, userId);
     }
 
@@ -147,7 +188,7 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
             ServerHttpResponse originalResponse = exchange.getResponse();
             // 缓存数据的工厂
             DataBufferFactory bufferFactory = originalResponse.bufferFactory();
-            // 06 响应结束，拿到响应码
+            // 07 响应结束，拿到响应码
             HttpStatus statusCode = originalResponse.getStatusCode();
             if (statusCode == HttpStatus.OK) {
                 // 装饰，增强能力
@@ -162,7 +203,7 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
                             // 拼接字符串
                             return super.writeWith(
                                     fluxBody.map(dataBuffer -> {
-                                        // 7. 调用成功，接口调用次数 + 1 invokeCount
+                                        // 08 调用成功，接口调用次数 + 1 invokeCount
                                         try {
                                             innerUserInterfaceInfoService.invokeCount(interfaceInfoId, userId);
                                         } catch (Exception e) {
@@ -227,6 +268,13 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
     public Mono<Void> handleError(ServerHttpResponse response){
         response.setStatusCode(HttpStatus.INTERNAL_SERVER_ERROR);
         return response.setComplete();
+    }
+    public HashMap<String,String> toHashMap(MultiValueMap<String,String> map){
+        HashMap<String, String> hashMap = new HashMap<>();
+        for(String key:map.keySet()){
+            hashMap.put(key,map.get(key).get(0));
+        }
+        return hashMap;
     }
 }
 

@@ -12,6 +12,8 @@ dubbo:
   application:
     name: openAPI-backend
   # 设置dubbo的协议为dubbo，随机分配端口
+    qos:
+      enable: false
   protocol:
     name: dubbo
     port: 22223
